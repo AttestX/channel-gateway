@@ -1,0 +1,282 @@
+#!/opt/channels/python/bin/python3
+"""channel-gateway: chat channels for an agent, through Hermes's gateway in proxy mode.
+
+It runs beside the agent and supervises one `hermes gateway run`:
+
+- The gateway starts once a chat app is configured: every variable that app
+  requires is set in $CHANNEL_GATEWAY_HOME/.env (the names Hermes reads, e.g.
+  TELEGRAM_BOT_TOKEN). Until then nothing runs.
+- It is restarted when that file (or config.extra.json) changes, and stopped
+  when no app is left.
+- Every message from an allowed user is forwarded to the agent's
+  POST {CHANNEL_GATEWAY_AGENT_URL}/v1/chat/completions (stream: true), with
+  Bearer CHANNEL_GATEWAY_AGENT_KEY. Hermes runs no model of its own.
+
+Standard library only; it runs on the Python bundled in /opt/channels.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(os.environ.get("CHANNEL_GATEWAY_ROOT", "/opt/channels"))
+HERMES = ROOT / "venv" / "bin" / "hermes"
+
+# The chat apps installed, by the variables each requires (each plugin's
+# requires_env in Hermes). tests/test_image.py checks this against the plugins.
+PLATFORMS: dict[str, tuple[str, ...]] = {
+    "telegram": ("TELEGRAM_BOT_TOKEN",),
+    "discord": ("DISCORD_BOT_TOKEN",),
+    "slack": ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"),
+    "feishu": ("FEISHU_APP_ID", "FEISHU_APP_SECRET"),
+    "dingtalk": ("DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET"),
+    "wecom": ("WECOM_BOT_ID", "WECOM_SECRET"),
+    "mattermost": ("MATTERMOST_URL", "MATTERMOST_TOKEN"),
+}
+
+# Variables passed from our environment to the gateway. Nothing else is: the
+# agent's own secrets (model keys, wallet access) never reach it, and the chat
+# credentials come from the .env file, which Hermes reads itself.
+PASSED = ("LANG", "LC_ALL", "TZ", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+          "http_proxy", "https_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR")
+
+# No user is a Hermes admin, so its own slash commands (/model, /sethome, ...),
+# which mean nothing when another agent answers, are refused; /help and /whoami
+# stay (whoami tells a user the ID an owner pairs). That also silences the
+# "no home channel" prompt, which only admins get.
+NO_ADMIN = ["channel-gateway-no-admin"]
+
+
+def base_config() -> dict:
+    """config.yaml, written as JSON (which YAML reads) on every start."""
+    return {
+        # A second message while the agent is still answering waits for that
+        # answer instead of cutting it off, so a long run keeps its stream.
+        "display": {"busy_input_mode": "queue"},
+        "platforms": {
+            name: {"extra": {"allow_admin_from": NO_ADMIN, "group_allow_admin_from": NO_ADMIN}}
+            for name in PLATFORMS
+        },
+    }
+
+
+def merge(base: dict, extra: dict) -> dict:
+    """``extra`` over ``base``, recursively for mappings."""
+    out = dict(base)
+    for key, value in extra.items():
+        out[key] = merge(out[key], value) if isinstance(value, dict) and isinstance(out.get(key), dict) else value
+    return out
+
+
+STOP_SECONDS = 20
+HEALTHY_SECONDS = 60
+MAX_BACKOFF = 60.0
+
+
+def log(message: str) -> None:
+    print(f"channel-gateway: {message}", file=sys.stderr, flush=True)
+
+
+def read_env(path: Path) -> dict[str, str]:
+    """KEY=value lines as in Hermes's .env: blanks and comments skipped, one pair of quotes removed."""
+    values: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return values
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def configured(values: dict[str, str]) -> list[str]:
+    """The chat apps whose required variables are all set."""
+    return [name for name, needed in PLATFORMS.items() if all(values.get(v) for v in needed)]
+
+
+def settings(environ: dict[str, str]) -> dict[str, str]:
+    home = environ.get("CHANNEL_GATEWAY_HOME") or str(Path(environ.get("HOME", "/tmp")) / ".channel-gateway")
+    url = (environ.get("CHANNEL_GATEWAY_AGENT_URL") or "http://127.0.0.1:18789").rstrip("/")
+    key = environ.get("CHANNEL_GATEWAY_AGENT_KEY") or environ.get("OPENCLAW_GATEWAY_TOKEN") or ""
+    if not url.startswith(("http://", "https://")):
+        raise SystemExit("channel-gateway: CHANNEL_GATEWAY_AGENT_URL must be http(s)")
+    return {"home": home, "url": url, "key": key}
+
+
+def child_env(environ: dict[str, str], conf: dict[str, str]) -> dict[str, str]:
+    env = {k: environ[k] for k in PASSED if k in environ}
+    env.update(
+        PATH=f"{ROOT / 'venv' / 'bin'}:/usr/local/bin:/usr/bin:/bin",
+        HOME=environ.get("HOME") or conf["home"],
+        HERMES_HOME=conf["home"],
+        GATEWAY_PROXY_URL=conf["url"],
+        GATEWAY_PROXY_KEY=conf["key"],
+        # We supervise: the gateway runs in the foreground and simply exits.
+        HERMES_GATEWAY_NO_SUPERVISE="1",
+        PYTHONUNBUFFERED="1",
+    )
+    env.setdefault("LANG", "C.UTF-8")
+    return env
+
+
+def write_config(home: Path) -> None:
+    """config.yaml from base_config(), with config.extra.json (if any) merged over it."""
+    config = base_config()
+    extra = home / "config.extra.json"
+    if extra.exists():
+        try:
+            more = json.loads(extra.read_text(encoding="utf-8"))
+        except ValueError as e:
+            raise ValueError(f"{extra}: {e}") from None
+        if not isinstance(more, dict):
+            raise ValueError(f"{extra}: must hold a JSON object")
+        config = merge(config, more)
+    tmp = home / ".config.yaml.tmp"
+    tmp.write_text("# Written by channel-gateway on every start; put additions in config.extra.json.\n"
+                   + json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, home / "config.yaml")
+
+
+def digest(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return "-"
+
+
+class Supervisor:
+    def __init__(self, environ: dict[str, str]):
+        self.environ = environ
+        self.conf = settings(environ)
+        self.home = Path(self.conf["home"])
+        self.env_file = self.home / ".env"
+        self.poll = float(environ.get("CHANNEL_GATEWAY_POLL_SECONDS", "5"))
+        self.child: subprocess.Popen | None = None
+        self.started_with = ""  # the inputs the running gateway was started with
+        self.started_at = 0.0
+        self.retry_at = 0.0
+        self.backoff = 1.0
+        self.refused = ""  # inputs that could not be started from; retried once they change
+        self.stopping = False
+
+    def inputs(self) -> str:
+        return digest(self.env_file) + digest(self.home / "config.extra.json")
+
+    def start(self, apps: list[str], inputs: str) -> None:
+        write_config(self.home)
+        log(f"starting the gateway for {', '.join(apps)}; messages go to {self.conf['url']}")
+        self.child = subprocess.Popen(
+            [str(HERMES), "gateway", "run"],
+            env=child_env(self.environ, self.conf),
+            cwd=self.home,
+            start_new_session=True,
+        )
+        self.started_with, self.started_at = inputs, time.monotonic()
+
+    def stop(self, why: str) -> None:
+        child, self.child = self.child, None
+        if child is None or child.poll() is not None:
+            return
+        log(f"stopping the gateway: {why}")
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+            child.wait(STOP_SECONDS)
+        except subprocess.TimeoutExpired:
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+        except ProcessLookupError:
+            pass
+
+    def tick(self, now: float) -> None:
+        inputs = self.inputs()
+        apps = configured(read_env(self.env_file))
+        if self.child is not None and self.child.poll() is not None:
+            code = self.child.returncode
+            self.child = None
+            if now - self.started_at >= HEALTHY_SECONDS:
+                self.backoff = 1.0
+            log(f"the gateway exited with {code}; restarting in {self.backoff:.0f}s")
+            self.retry_at = now + self.backoff
+            self.backoff = min(self.backoff * 2, MAX_BACKOFF)
+        if self.child is not None and not apps:
+            self.stop("no chat app is configured")
+        elif self.child is not None and inputs != self.started_with:
+            self.stop("its configuration changed")
+            self.retry_at = 0.0
+        if self.child is None and apps and now >= self.retry_at and inputs != self.refused:
+            try:
+                self.start(apps, inputs)
+            except (OSError, ValueError) as e:
+                log(f"cannot start the gateway: {e}; waiting for the configuration to change")
+                self.refused = inputs
+
+    def run(self) -> int:
+        self.home.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+        def on_signal(_signum, _frame):
+            self.stopping = True
+
+        signal.signal(signal.SIGTERM, on_signal)
+        signal.signal(signal.SIGINT, on_signal)
+        if not self.conf["key"]:
+            log("warning: no agent key (CHANNEL_GATEWAY_AGENT_KEY or OPENCLAW_GATEWAY_TOKEN)")
+        if not configured(read_env(self.env_file)):
+            log(f"no chat app configured in {self.env_file}; waiting for one")
+        while not self.stopping:
+            self.tick(time.monotonic())
+            end = time.monotonic() + self.poll
+            while not self.stopping and time.monotonic() < end:
+                time.sleep(min(0.5, self.poll))
+        self.stop("asked to stop")
+        return 0
+
+
+def pair_command(args: list[str]) -> list[str]:
+    """`pair <platform> <code>`: approve the pairing code a user was sent (Hermes's DM pairing)."""
+    if len(args) != 2:
+        raise SystemExit("usage: channel-gateway pair <platform> <code>")
+    platform, code = args
+    if platform not in PLATFORMS:
+        raise SystemExit(f"channel-gateway: unknown platform {platform!r}")
+    if not (code.isascii() and code.isalnum() and 0 < len(code) <= 32):
+        raise SystemExit("channel-gateway: a pairing code is letters and digits")
+    return [str(HERMES), "pairing", "approve", platform, code]
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help"):
+        print(__doc__)
+        print("Commands: (none) supervise the gateway; pair <platform> <code>; --version")
+        return 0
+    if args and args[0] == "--version":
+        print((ROOT / "HERMES_COMMIT").read_text(encoding="utf-8").strip())
+        return 0
+    if args and args[0] == "pair":
+        environ = dict(os.environ)
+        argv = pair_command(args[1:])
+        os.execve(argv[0], argv, child_env(environ, settings(environ)))
+    if args:
+        raise SystemExit(f"channel-gateway: unknown command {args[0]!r}")
+    return Supervisor(dict(os.environ)).run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
