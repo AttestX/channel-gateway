@@ -1,0 +1,108 @@
+# Test every PR and every push to main; publish from main.
+#
+# The release reference is derived from this repo:
+#   Hermes version  <- Dockerfile (ARG HERMES_TAG)
+#   gateway revision <- GATEWAY_REVISION below
+# A published reference is never overwritten: a merge that bumps neither
+# publishes only its own sha-<commit> tag (and warns). Agent images pin the
+# reference they embed, so a release must not move under them.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GATEWAY_REVISION: "1"
+  IMAGE: channel-gateway:test
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: The pinned commit is Hermes's tag
+        run: |
+          set -euo pipefail
+          tag=$(sed -n 's/^ARG HERMES_TAG=//p' Dockerfile)
+          commit=$(sed -n 's/^ARG HERMES_COMMIT=//p' Dockerfile)
+          refs=$(git ls-remote https://github.com/NousResearch/hermes-agent.git "refs/tags/${tag}" "refs/tags/${tag}^{}")
+          # An annotated tag lists its own object first; the peeled ^{} line is the commit.
+          remote=$(awk -v t="refs/tags/${tag}^{}" '$2==t{print $1}' <<<"$refs")
+          [ -n "$remote" ] || remote=$(awk -v t="refs/tags/${tag}" '$2==t{print $1}' <<<"$refs")
+          echo "$tag -> $remote (pinned $commit)"
+          test -n "$remote" && test "$remote" = "$commit"
+
+      - name: Supervisor tests
+        run: python3 -m unittest -v tests/test_supervisor.py
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build
+        run: docker buildx build --load -t "$IMAGE" .
+
+      - name: Image tests
+        working-directory: tests
+        run: python3 -m unittest -v test_image
+
+  publish:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve image reference
+        id: ref
+        run: |
+          tag=$(sed -n 's/^ARG HERMES_TAG=//p' Dockerfile | sed 's/^v//')
+          if [ -z "$tag" ]; then
+            echo "::error::could not read HERMES_TAG from Dockerfile"
+            exit 1
+          fi
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/channel-gateway:${tag}-${GATEWAY_REVISION}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        env:
+          RELEASE: ${{ steps.ref.outputs.image }}
+        run: |
+          set -euo pipefail
+          # Never move a reference an agent image may already embed.
+          if out=$(docker buildx imagetools inspect "$RELEASE" 2>&1); then
+            exists=1
+          elif grep -qi "not found" <<<"$out"; then
+            exists=0
+          else
+            echo "::error::could not check whether $RELEASE exists: $out"
+            exit 1
+          fi
+          candidate="${RELEASE%:*}:sha-$(git rev-parse HEAD)"
+          docker build \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.licenses=MIT" \
+            -t "$candidate" .
+          docker push "$candidate"
+          if [ "$exists" = 1 ]; then
+            echo "::warning::$RELEASE is already published and is left as it is; bump GATEWAY_REVISION (or HERMES_TAG) to release this build. It is published only as $candidate."
+            exit 0
+          fi
+          docker tag "$candidate" "$RELEASE"
+          docker push "$RELEASE"
+          echo "published $RELEASE"
